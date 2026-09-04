@@ -81,12 +81,20 @@ python sys_info.py
 | macOS | `system_profiler` | Fallback for GPU name only |
 | macOS | `powermetrics` | Requires `sudo`; most detailed |
 
+## RAM Measurement Methods (Top Processes)
+
+| Platform | Method | Notes |
+|----------|--------|-------|
+| macOS | `proc_pid_rusage` (RUSAGE_INFO_V4) | `ri_phys_footprint` — includes compressed memory, matches Activity Monitor |
+| Windows / Linux | `psutil` RSS | Resident Set Size — physical pages in RAM only |
+
 ## RAM Definitions
 
 - **Free** — Memory not used for anything
 - **Reclaimable** — Cached data and buffers that the OS can release under memory pressure
 - **Available** — `Free + Reclaimable`; the actual memory available to applications
 - **Top Processes** — CPU sampling takes ~1 second for accurate results; GPU memory requires NVIDIA (`nvidia-smi`)
+- **macOS RAM** — Top processes use `phys_footprint` via `proc_pid_rusage`, which includes compressed memory and matches Activity Monitor's "Memory" column. Other platforms use RSS (Resident Set Size), which excludes compressed memory and may show lower values than Activity Monitor on macOS.
 
 ## License
 
