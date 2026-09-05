@@ -17,6 +17,9 @@ Cross-platform Python script that reports system resource usage on **Windows 11*
 | **GPU** | Name | GPU model name |
 | | GPU Load | GPU compute utilization |
 | | VRAM | VRAM usage (NVIDIA only) |
+| **Disk** | Total | Total disk capacity per volume |
+| | Used | Space used per volume |
+| | Free | Space free per volume |
 | **Top Processes** | By CPU | Top 5 processes by CPU% |
 | | By RAM | Top 5 processes by RAM% and MB |
 | | By GPU Memory | Top 5 processes by GPU memory (NVIDIA only) |
