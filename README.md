@@ -20,6 +20,11 @@ Cross-platform Python script that reports system resource usage on **Windows 11*
 | **Disk** | Total | Total disk capacity per volume |
 | | Used | Space used per volume |
 | | Free | Space free per volume |
+| **Container** | CPU Quota | CFS quota in cores (cgroup v2/v1) |
+| | Effective Cores | `min(quota, sched_getaffinity)` |
+| | Container CPU Load | CPU time as % of the container's allowance |
+| | RAM Limit | cgroup memory limit (when lower than host RAM) |
+| | Container Used | cgroup usage excl. inactive file cache (`docker stats`-style) |
 | **Top Processes** | By CPU | Top 5 processes by CPU% |
 | | By RAM | Top 5 processes by RAM% and MB |
 | | By GPU Memory | Top 5 processes by GPU memory (NVIDIA only) |
@@ -44,6 +49,12 @@ pip install WMI  # Windows only, optional
 
 ```bash
 python sys_info.py
+```
+
+### JSON Output
+
+```bash
+python sys_info.py --json   # machine-readable; includes container limits
 ```
 
 ### Example Output
@@ -90,6 +101,22 @@ python sys_info.py
 |----------|--------|-------|
 | macOS | `proc_pid_rusage` (RUSAGE_INFO_V4) | `ri_phys_footprint` — includes compressed memory, matches Activity Monitor |
 | Windows / Linux | `psutil` RSS | Resident Set Size — physical pages in RAM only |
+
+## Container Awareness (Linux)
+
+In containers (Docker, RunPod, Kubernetes, LXC), `/proc` and `psutil` reflect the
+**host**, not the container. The script also reads cgroup limits and reports both views:
+
+| Metric | Source | Notes |
+|--------|--------|-------|
+| CPU Quota | cgroup v2 `cpu.max` / v1 `cpu.cfs_quota_us` + `cpu.cfs_period_us` | CFS quota expressed in cores |
+| Effective Cores | `min(quota, sched_getaffinity)` | Cores actually usable by the process |
+| Container CPU Load | cgroup `cpu.stat` / `cpuacct.usage` | CPU time as % of the quota, 1 s sample |
+| RAM Limit | cgroup v2 `memory.max` / v1 `memory.limit_in_bytes` | Shown when lower than host RAM |
+| Container Used | `memory.current` − `inactive_file` | Matches `docker stats` |
+
+Host metrics remain displayed for reference; container values are prefixed `Container`.
+Top-process RAM percentages are computed against the container limit when set.
 
 ## RAM Definitions
 

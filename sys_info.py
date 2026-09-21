@@ -10,6 +10,7 @@ GPU detection is best-effort — nvidia-smi, WMI, or /sys/class/drm.
 import sys
 import os
 import re
+import json
 import platform
 import subprocess
 import shutil
@@ -46,7 +47,150 @@ def run_cmd(cmd, timeout=10):
 
 # ── RAM ─────────────────────────────────────────────────────────────────────
 
-def get_ram_info():
+# ── Container limits (Linux cgroups) ────────────────────────────────────────
+
+def _read_file(path):
+    """Read a small sysfs/cgroup file; return stripped text or None."""
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _read_int(path):
+    val = _read_file(path)
+    if val is None:
+        return None
+    try:
+        return int(val.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _read_int_any(paths):
+    for p in paths:
+        val = _read_int(p)
+        if val is not None:
+            return val
+    return None
+
+
+def _cgroup_cpu_usage_usec(version):
+    """Cumulative CPU time used by this cgroup, in microseconds."""
+    if version == 2:
+        stat = _read_file("/sys/fs/cgroup/cpu.stat")
+        if stat:
+            for line in stat.splitlines():
+                if line.startswith("usage_usec"):
+                    try:
+                        return int(line.split()[1])
+                    except (ValueError, IndexError):
+                        return None
+    elif version == 1:
+        # cpuacct.usage is in nanoseconds
+        ns = _read_int_any([
+            "/sys/fs/cgroup/cpuacct/cpuacct.usage",
+            "/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage",
+        ])
+        if ns is not None and ns > 0:
+            return ns // 1000
+    return None
+
+
+def _cgroup_mem_used_bytes(version):
+    """Current cgroup memory usage excluding inactive file cache
+    (same approximation `docker stats` uses)."""
+    if version == 2:
+        current = _read_int("/sys/fs/cgroup/memory.current")
+        stat = _read_file("/sys/fs/cgroup/memory.stat")
+        inactive = None
+        if stat:
+            for line in stat.splitlines():
+                if line.startswith("inactive_file"):
+                    try:
+                        inactive = int(line.split()[1])
+                    except (ValueError, IndexError):
+                        pass
+    elif version == 1:
+        current = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        stat = _read_file("/sys/fs/cgroup/memory/memory.stat")
+        inactive = None
+        if stat:
+            for line in stat.splitlines():
+                if line.startswith("total_inactive_file"):
+                    try:
+                        inactive = int(line.split()[1])
+                    except (ValueError, IndexError):
+                        pass
+    else:
+        return None
+    if current is None:
+        return None
+    if inactive is not None:
+        return max(0, current - inactive)
+    return current
+
+
+def get_cgroup_info():
+    """
+    Detect container resource limits via cgroups (Linux only).
+
+    Returns dict:
+      version          — 2, 1, or None (None = no cgroup limits / not Linux)
+      cpu_quota_cores  — CPU allowance from the CFS quota, None if unlimited
+      mem_limit_bytes  — memory limit in bytes, None if unlimited
+      mem_used_bytes   — current usage excluding inactive file cache
+    """
+    info = {"version": None, "cpu_quota_cores": None,
+            "mem_limit_bytes": None, "mem_used_bytes": None}
+    if sys.platform != "linux":
+        return info
+
+    # ── cgroup v2 (unified hierarchy) ──
+    cpu_max = _read_file("/sys/fs/cgroup/cpu.max")
+    if cpu_max is not None:
+        info["version"] = 2
+        parts = cpu_max.split()
+        if len(parts) == 2 and parts[0] != "max":
+            try:
+                quota, period = int(parts[0]), int(parts[1])
+                if quota > 0 and period > 0:
+                    info["cpu_quota_cores"] = quota / period
+            except (ValueError, ZeroDivisionError):
+                pass
+        mem_max = _read_file("/sys/fs/cgroup/memory.max")
+        if mem_max and mem_max != "max":
+            try:
+                info["mem_limit_bytes"] = int(mem_max)
+            except ValueError:
+                pass
+        info["mem_used_bytes"] = _cgroup_mem_used_bytes(2)
+        return info
+
+    # ── cgroup v1 ──
+    quota = _read_int_any([
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+        "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us",
+    ])
+    period = _read_int_any([
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+        "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us",
+    ])
+    if quota is not None or period is not None:
+        info["version"] = 1
+        if quota and quota > 0 and period and period > 0:
+            info["cpu_quota_cores"] = quota / period
+        mem_max = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        # v1 reports ~9.2 EB as a "no limit" sentinel — filter it out
+        if mem_max is not None and 0 < mem_max < (1 << 60):
+            info["mem_limit_bytes"] = mem_max
+        info["mem_used_bytes"] = _cgroup_mem_used_bytes(1)
+
+    return info
+
+
+def get_ram_info(cgroup=None):
     mem = psutil.virtual_memory()
     total = mem.total
     free = mem.free
@@ -56,7 +200,7 @@ def get_ram_info():
     # Reclaimable = available - free  (cached/buffers that can be released)
     reclaimable = max(0, available - free)
 
-    return {
+    info = {
         "total_gb": fmt_gb(total),
         "used_gb": fmt_gb(used),
         "used_pct": fmt_pct(used / total) if total else "0%",
@@ -68,17 +212,62 @@ def get_ram_info():
         "available_gb": fmt_gb(available),
     }
 
+    # Inside a container the cgroup limit is the real ceiling — psutil's
+    # "available" reflects the host, not what this container may consume.
+    limit = cgroup.get("mem_limit_bytes") if cgroup else None
+    if limit and total and limit < total:
+        c_used = cgroup.get("mem_used_bytes")
+        info["container"] = {
+            "limit_gb": fmt_gb(limit),
+            "used_gb": fmt_gb(c_used) if c_used is not None else None,
+            "used_pct": fmt_pct(c_used / limit) if c_used is not None else None,
+            "available_gb": fmt_gb(limit - c_used) if c_used is not None else None,
+        }
+    return info
+
 # ── CPU ─────────────────────────────────────────────────────────────────────
 
-def get_cpu_load():
-    # psutil gives per-core and overall; interval=None = non-blocking
+def get_effective_cpu_count(cgroup=None):
+    """CPUs actually available to this process:
+    min(sched_getaffinity, cgroup CFS quota), falling back to psutil count."""
+    host = psutil.cpu_count(logical=True) or 1
+    affinity = None
+    try:
+        affinity = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        pass
+    quota = cgroup.get("cpu_quota_cores") if cgroup else None
+    candidates = [c for c in (affinity, quota) if c and c > 0]
+    effective = float(min(candidates)) if candidates else float(host)
+    return effective, affinity, quota, host
+
+
+def get_cpu_load(cgroup=None):
+    # psutil gives per-core and overall; interval=1 blocks for a 1s sample.
+    # Sample cgroup CPU time around the same window (no extra sleep).
+    version = cgroup.get("version") if cgroup else None
+    u0 = _cgroup_cpu_usage_usec(version) if version else None
+
     overall = psutil.cpu_percent(interval=1)
     per_core = psutil.cpu_percent(interval=0, percpu=True)
+    effective, affinity, quota, host = get_effective_cpu_count(cgroup)
+
+    container_pct = None
+    if u0 is not None and quota:
+        u1 = _cgroup_cpu_usage_usec(version)
+        if u1 is not None and u1 > u0:
+            cpu_seconds = (u1 - u0) / 1e6
+            container_pct = cpu_seconds / quota * 100
+
     return {
         "overall_pct": f"{overall:.1f}%",
         "per_core_pct": [f"{c:.1f}%" for c in per_core],
         "core_count_physical": psutil.cpu_count(logical=False),
-        "core_count_logical": psutil.cpu_count(logical=True),
+        "core_count_logical": host,
+        "effective_cores": effective,
+        "affinity_cores": affinity,
+        "quota_cores": quota,
+        "container_pct": container_pct,
     }
 
 # ── GPU ──────────────────────────────────────────────────────────────────────
@@ -345,14 +534,18 @@ def _get_phys_footprint_macos(pid):
     return None
 
 
-def get_top_processes_ram(n=5):
+def get_top_processes_ram(n=5, cgroup=None):
     """Get top N processes by RAM usage.
 
     On macOS, uses phys_footprint (includes compressed memory) to match
     Activity Monitor. On other platforms, uses RSS via psutil.
+    Percentages are relative to the container memory limit when set.
     """
     procs = []
     total_mem = psutil.virtual_memory().total
+    limit = cgroup.get("mem_limit_bytes") if cgroup else None
+    if limit and total_mem and limit < total_mem:
+        total_mem = limit
     use_footprint = sys.platform == "darwin"
 
     for p in psutil.process_iter(['pid', 'name']):
@@ -367,8 +560,9 @@ def get_top_processes_ram(n=5):
                     mem_pct = (footprint / total_mem) * 100
 
             if mem_mb is None:
-                mem_pct = p.memory_percent()
-                mem_mb = p.memory_info().rss / (1024 * 1024)
+                rss = p.memory_info().rss
+                mem_pct = (rss / total_mem) * 100 if total_mem else 0.0
+                mem_mb = rss / (1024 * 1024)
 
             procs.append({'pid': p.pid, 'name': p.info['name'], 'mem_pct': mem_pct,
                          'mem_mb': mem_mb})
@@ -441,31 +635,82 @@ def get_disk_info():
 
 # ── Display ─────────────────────────────────────────────────────────────────
 
-def display_all():
+def collect_all():
+    """Gather all metrics into one dict (shared by text and --json output)."""
+    cgroup = get_cgroup_info()
+    gpus, gpu_method = get_gpu_load()
+    has_limits = bool(cgroup["cpu_quota_cores"] or cgroup["mem_limit_bytes"])
+    return {
+        "platform": f"{platform.system()} {platform.release()}",
+        "host": platform.node(),
+        "python": platform.python_version(),
+        "container": {
+            "cgroup_version": cgroup["version"],
+            "cpu_quota_cores": cgroup["cpu_quota_cores"],
+            "mem_limit_gb": fmt_gb(cgroup["mem_limit_bytes"]) if cgroup["mem_limit_bytes"] else None,
+        } if has_limits else None,
+        "ram": get_ram_info(cgroup),
+        "cpu": get_cpu_load(cgroup),
+        "gpus": gpus,
+        "gpu_source": gpu_method,
+        "disks": get_disk_info(),
+        "top_cpu": get_top_processes_cpu(n=5),
+        "top_ram": get_top_processes_ram(n=5, cgroup=cgroup),
+        "top_gpu": get_top_processes_gpu(n=5),
+    }
+
+
+def display_all(data):
     print("=" * 60)
-    print(f"  System Info — {platform.system()} {platform.release()}")
-    print(f"  Host: {platform.node()} | Python {platform.python_version()}")
+    print(f"  System Info — {data['platform']}")
+    print(f"  Host: {data['host']} | Python {data['python']}")
+    if data.get("container"):
+        c = data["container"]
+        bits = []
+        if c["cpu_quota_cores"]:
+            bits.append(f"CPU quota {c['cpu_quota_cores']:g}")
+        if c["mem_limit_gb"]:
+            bits.append(f"RAM limit {c['mem_limit_gb']} GB")
+        print(f"  Container: cgroup v{c['cgroup_version']} — {', '.join(bits)}")
     print("=" * 60)
 
     # RAM
-    ram = get_ram_info()
+    ram = data["ram"]
+    in_container = ram.get("container") is not None
+    host_tag = "  (host)" if in_container else ""
     print("\n── Memory (RAM) ──")
-    print(f"  Total RAM:         {ram['total_gb']} GB")
+    print(f"  Total RAM:         {ram['total_gb']} GB{host_tag}")
     print(f"  Used RAM:          {ram['used_gb']} GB  ({ram['used_pct']})")
     print(f"  Free RAM:          {ram['free_gb']} GB  ({ram['free_pct']})")
     print(f"  Reclaimable RAM:   {ram['reclaimable_gb']} GB  ({ram['reclaimable_pct']})")
     print(f"  Available RAM:     {ram['available_gb']} GB  ({ram['available_pct']}, free + reclaimable)")
+    c = ram.get("container")
+    if c:
+        print(f"  Container Limit:   {c['limit_gb']} GB")
+        if c["used_gb"] is not None:
+            print(f"  Container Used:    {c['used_gb']} GB  ({c['used_pct']} of limit)")
+            print(f"  Container Avail:   {c['available_gb']} GB")
 
     # CPU
-    cpu = get_cpu_load()
+    cpu = data["cpu"]
     print("\n── CPU ──")
-    print(f"  CPU Load:          {cpu['overall_pct']}")
+    print(f"  CPU Load:          {cpu['overall_pct']}{host_tag}")
     print(f"  Physical Cores:    {cpu['core_count_physical']}")
     print(f"  Logical Cores:     {cpu['core_count_logical']}")
-    print(f"  Per-Core Load:     {', '.join(cpu['per_core_pct'])}")
+    per_core = cpu["per_core_pct"]
+    shown = per_core[:16]
+    more = f" … (+{len(per_core) - 16} more)" if len(per_core) > 16 else ""
+    print(f"  Per-Core Load:     {', '.join(shown)}{more}")
+    if cpu["quota_cores"] or (cpu["affinity_cores"] and cpu["core_count_logical"]
+                              and cpu["affinity_cores"] < cpu["core_count_logical"]):
+        quota_str = f"{cpu['quota_cores']:g}" if cpu["quota_cores"] else "none"
+        aff_str = cpu["affinity_cores"] if cpu["affinity_cores"] is not None else "n/a"
+        print(f"  Effective Cores:   {cpu['effective_cores']:g}  (quota: {quota_str}, affinity: {aff_str})")
+        if cpu["container_pct"] is not None:
+            print(f"  Container Load:    {cpu['container_pct']:.1f}% of {cpu['quota_cores']:g}-core allowance")
 
     # GPU
-    gpus, method = get_gpu_load()
+    gpus, method = data["gpus"], data["gpu_source"]
     print(f"\n── GPU (source: {method}) ──")
     for i, gpu in enumerate(gpus):
         label = f"  GPU {i}" if len(gpus) > 1 else "  GPU"
@@ -478,9 +723,8 @@ def display_all():
         print(line)
 
     # Disk
-    disks = get_disk_info()
     print("\n── Disk Space ──")
-    for d in disks:
+    for d in data["disks"]:
         label = f"{d['mountpoint']}"
         if d['device'] and d['device'] != d['mountpoint']:
             label = f"{d['device']} ({d['mountpoint']})"
@@ -488,23 +732,24 @@ def display_all():
 
     # Top processes
     print("\n── Top Processes by CPU ──")
-    top_cpu = get_top_processes_cpu(n=5)
-    for p in top_cpu:
+    for p in data["top_cpu"]:
         print(f"  {p['pid']:>7}  {p['cpu_pct']:6.1f}%  {p['name']}")
 
     print("\n── Top Processes by RAM ──")
-    top_ram = get_top_processes_ram(n=5)
-    for p in top_ram:
+    for p in data["top_ram"]:
         print(f"  {p['pid']:>7}  {p['mem_pct']:6.1f}%  {p['mem_mb']:7.1f} MB  {p['name']}")
 
-    top_gpu = get_top_processes_gpu(n=5)
-    if top_gpu:
+    if data["top_gpu"]:
         print("\n── Top Processes by GPU Memory ──")
-        for p in top_gpu:
+        for p in data["top_gpu"]:
             print(f"  {p['pid']:>7}  {p['gpu_mem_mb']:7.0f} MB  {p['name']}")
 
     print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":
-    display_all()
+    data = collect_all()
+    if "--json" in sys.argv:
+        print(json.dumps(data, indent=2))
+    else:
+        display_all(data)
